@@ -3,9 +3,14 @@ package open115
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/rclone/rclone/lib/rest"
 	"math/big"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,42 +31,40 @@ const (
 	qrCodePollInterval   = 2 * time.Second    // Polling interval
 )
 
-// QRCodeStatus represents QR code scanning status
-type QRCodeStatus int
+// qrCodeStatus represents QR code scanning status
+type qrCodeStatus int
 
 // Scanning status
 const (
-	QRCodeStatusWaiting   QRCodeStatus = 0 // Waiting for scan
-	QRCodeStatusScanned   QRCodeStatus = 1 // Scanned, waiting for confirmation
-	QRCodeStatusConfirmed QRCodeStatus = 2 // Confirmed
+	qrCodeStatusWaiting   qrCodeStatus = 0 // Waiting for scan
+	qrCodeStatusScanned   qrCodeStatus = 1 // Scanned, waiting for confirmation
+	qrCodeStatusConfirmed qrCodeStatus = 2 // Confirmed
 )
 
 // TokenSource is a custom OAuth2 TokenSource implementation
 type TokenSource struct {
-	client *client          // API client
+	name   string           // Remote name
+	ctx    context.Context  // Context
+	c      *rest.Client     // API client
 	token  *api.Token       // Current token
 	expiry time.Time        // Token expiry time
-	ctx    context.Context  // Context
-	name   string           // Remote name
 	m      configmap.Mapper // Configuration mapper
 	mu     sync.RWMutex     // Mutex
 }
 
 // NewTokenSource creates a new TokenSource
-func NewTokenSource(ctx context.Context, name string, m configmap.Mapper, client *client) (*TokenSource, error) {
+func NewTokenSource(ctx context.Context, name string, m configmap.Mapper, client *rest.Client) (*TokenSource, error) {
 	ts := &TokenSource{
-		client: client,
-		ctx:    ctx,
-		name:   name,
-		m:      m,
+		c:    client,
+		ctx:  ctx,
+		name: name,
+		m:    m,
 	}
-
 	// Try to load token from configuration
 	err := ts.readToken()
 	if err != nil {
 		return nil, err
 	}
-
 	return ts, nil
 }
 
@@ -132,7 +135,15 @@ func (ts *TokenSource) refreshToken() error {
 	if ts.token == nil || ts.token.RefreshToken == "" {
 		return fmt.Errorf("no valid refresh token, please run 'rclone config reconnect %s:'", ts.name)
 	}
-	resp, err := ts.client.RefreshToken(ts.ctx, ts.token.RefreshToken)
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     passportAPI,
+		Path:        "/download/refreshToken",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(fmt.Sprintf("refresh_token=%s", ts.token.RefreshToken)),
+	}
+	var resp api.TokenResponse
+	_, err := ts.c.CallJSON(ts.ctx, &opts, nil, &resp)
 	if err != nil || resp.Data.AccessToken == "" {
 		return fmt.Errorf("failed to refresh token: %v", err)
 	}
@@ -163,35 +174,73 @@ func (ts *TokenSource) saveToken() error {
 	ts.m.Set(config.ConfigToken, string(tokenJSON))
 	return nil
 }
+func (ts *TokenSource) Auth(appId string) error {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	// Get QR code URL
+	authData, err := ts.getAuthURL(ts.ctx, appId)
+	if err != nil {
+		return err
+	}
+	// Display QR code URL for user to scan
+	fs.Logf(nil, "Please use the 115 mobile app to scan the QR code: %s", authData.QRCode)
+	// Wait for user to scan and confirm authorization
+	token, err := ts.waitForQRCodeScan(ts.ctx, authData)
+	if err != nil {
+		return err
+	}
+	ts.token = token
+	return ts.saveToken()
+}
 
 // getAuthURL generates QR code URL for user scanning
-func getAuthURL(ctx context.Context, client *client) (authData *api.AuthDeviceCodeData, err error) {
+func (ts *TokenSource) getAuthURL(ctx context.Context, appId string) (authData *api.AuthDeviceCodeData, err error) {
 	// Generate random code verifier
 	codeVerifier := generateCodeVerifier()
 
-	resp, err := client.AuthDeviceCode(ctx, codeVerifier)
+	// Calculate code challenge
+	codeChallenge := calculateCodeChallenge(codeVerifier)
+
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     passportAPI,
+		Path:        "/download/authDeviceCode",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(fmt.Sprintf("client_id=%s&code_challenge=%s&code_challenge_method=sha256", appId, codeChallenge)),
+	}
+	var resp api.AuthDeviceCodeResponse
+	_, err = ts.c.CallJSON(ctx, &opts, nil, &resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get authorization code: %w", err)
 	}
-
 	// Save code verifier to response
 	resp.Data.CodeVerifier = codeVerifier
-
 	return &resp.Data, nil
 }
 
 // pollQRCodeStatus polls QR code status
-func pollQRCodeStatus(ctx context.Context, client *client, authData *api.AuthDeviceCodeData) (QRCodeStatus, error) {
-	resp, err := client.PollQRCodeStatus(ctx, authData.UID, authData.Time, authData.Sign)
-	if err != nil {
-		return QRCodeStatusWaiting, err
+func (ts *TokenSource) pollQRCodeStatus(ctx context.Context, authData *api.AuthDeviceCodeData) (qrCodeStatus, error) {
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: qrcodeAPI,
+		Path:    "/get/status/",
+		Parameters: url.Values{
+			"uid":  []string{authData.UID},
+			"time": []string{fmt.Sprintf("%d", authData.Time)},
+			"sign": []string{authData.Sign},
+		},
 	}
 
-	return QRCodeStatus(resp.Data.Status), nil
+	var resp api.QRCodeStatusResponse
+	_, err := ts.c.CallJSON(ctx, &opts, nil, &resp)
+	if err != nil {
+		return qrCodeStatusWaiting, err
+	}
+	return qrCodeStatus(resp.Data.Status), nil
 }
 
 // waitForQRCodeScan waits for user to scan QR code and confirm authorization
-func waitForQRCodeScan(ctx context.Context, client *client, authData *api.AuthDeviceCodeData) (*api.Token, error) {
+func (ts *TokenSource) waitForQRCodeScan(ctx context.Context, authData *api.AuthDeviceCodeData) (*api.Token, error) {
 	// Set timeout
 	deadline := time.Now().Add(qrCodeTimeout)
 
@@ -204,17 +253,17 @@ func waitForQRCodeScan(ctx context.Context, client *client, authData *api.AuthDe
 		}
 
 		// Poll QR code status
-		status, err := pollQRCodeStatus(ctx, client, authData)
+		status, err := ts.pollQRCodeStatus(ctx, authData)
 		if err != nil {
 			fs.Logf(nil, "Failed to poll status: %v", err)
 		} else {
 			switch status {
-			case QRCodeStatusConfirmed:
+			case qrCodeStatusConfirmed:
 				// Confirmed, get token
-				return codeToToken(ctx, client, authData)
-			case QRCodeStatusScanned:
+				return ts.codeToToken(ctx, authData)
+			case qrCodeStatusScanned:
 				fs.Logf(nil, "QR code scanned, waiting for authorization confirmation...")
-			case QRCodeStatusWaiting:
+			case qrCodeStatusWaiting:
 				fs.Logf(nil, "Waiting for QR code scan...")
 			}
 		}
@@ -233,12 +282,19 @@ func waitForQRCodeScan(ctx context.Context, client *client, authData *api.AuthDe
 }
 
 // codeToToken uses authorization code to get token
-func codeToToken(ctx context.Context, client *client, authData *api.AuthDeviceCodeData) (*api.Token, error) {
-	resp, err := client.DeviceCodeToToken(ctx, authData.UID, authData.CodeVerifier)
+func (ts *TokenSource) codeToToken(ctx context.Context, authData *api.AuthDeviceCodeData) (*api.Token, error) {
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     passportAPI,
+		Path:        "/download/deviceCodeToToken",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(fmt.Sprintf("uid=%s&code_verifier=%s", authData.UID, authData.CodeVerifier)),
+	}
+	var resp api.DeviceCodeToTokenResponse
+	_, err := ts.c.CallJSON(ctx, &opts, nil, &resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token: %w", err)
 	}
-
 	// Create Token object
 	expiresAt := time.Now().Add(time.Duration(resp.Data.ExpiresIn) * time.Second)
 	token := &api.Token{
@@ -246,8 +302,13 @@ func codeToToken(ctx context.Context, client *client, authData *api.AuthDeviceCo
 		RefreshToken: resp.Data.RefreshToken,
 		ExpiresAt:    expiresAt,
 	}
-
 	return token, nil
+}
+
+// calculateCodeChallenge calculates the code challenge.
+func calculateCodeChallenge(codeVerifier string) string {
+	hash := sha256.Sum256([]byte(codeVerifier))
+	return base64.StdEncoding.EncodeToString(hash[:])
 }
 
 // generateCodeVerifier generates a code verifier

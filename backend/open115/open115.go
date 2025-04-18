@@ -10,12 +10,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rclone/rclone/fs/fserrors"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rclone/rclone/lib/rest"
 
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
@@ -35,6 +40,7 @@ const (
 	maxSleep      = 5 * time.Second        // maxSleep is the maximum sleep time between retries.
 	decayConstant = 2                      // decayConstant is the backoff factor.
 	rootID        = "0"                    // rootID is the ID of the root directory.
+	objectDir     = "0"
 )
 
 // init registers the backend.
@@ -60,18 +66,12 @@ func Register(fName string) {
 			if err != nil {
 				return nil, err
 			}
-			appId := func() string {
-				if opt.AppID != "" {
-					return opt.AppID
-				}
-				return defaultAppId
-			}()
-			fsClient := fshttp.NewClient(ctx)
-			p := fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+			fc := fshttp.NewClient(ctx)
+			rc := rest.NewClient(fc)
 			f := &Fs{
 				name:   name,
 				opt:    *opt,
-				client: newClient(fsClient, p, appId),
+				client: newClient(rc, nil),
 			}
 			return f.Config(ctx, name, m, config)
 		},
@@ -101,6 +101,7 @@ type Fs struct {
 	root        string             // root is the root path.
 	opt         Options            // opt stores the configuration options.
 	features    *fs.Features       // features caches the optional features.
+	pacer       *fs.Pacer          // pacer is the pacer for this Fs.
 	client      *client            // client is the API client.
 	tokenSource *TokenSource       // tokenSource provides API tokens.
 	dirCache    *dircache.DirCache // dirCache caches directory listings.
@@ -120,22 +121,22 @@ type Object struct {
 
 // ------------------------------------------------------------
 
-// Name returns the name of the remote.
+// Name returns the name of the remote (as passed into NewFs)
 func (f *Fs) Name() string {
 	return f.name
 }
 
-// Root returns the root path of the remote.
+// Root returns the root path of the remote (as passed into NewFs)
 func (f *Fs) Root() string {
 	return f.root
 }
 
-// String returns a description of the FS.
+// String converts this Fs to a string
 func (f *Fs) String() string {
 	return fmt.Sprintf("115 drive: %s", f.name)
 }
 
-// Features returns the optional features of this Fs.
+// Features returns the optional features of this Fs
 func (f *Fs) Features() *fs.Features {
 	return f.features
 }
@@ -149,21 +150,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 	root = strings.Trim(root, "/")
-	pc := fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
-	client := newClient(fshttp.NewClient(ctx), pc, opt.AppID)
+	fc := fshttp.NewClient(ctx)
+	rc := rest.NewClient(fc)
+	tokenSource, err := NewTokenSource(ctx, name, m, rc)
+	if err != nil {
+		return nil, err
+	}
+	c := newClient(rc, tokenSource)
 	f := &Fs{
 		name:   name,
 		root:   root,
 		opt:    *opt,
-		client: client,
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		client: c,
 	}
-
-	tokenSource, err := NewTokenSource(ctx, name, m, client)
-	if err != nil {
-		return nil, err
-	}
-	f.tokenSource = tokenSource
-
 	// Set features
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -210,27 +210,20 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 // FindLeaf finds a file or directory named leaf in the directory directoryID.
 func (f *Fs) FindLeaf(ctx context.Context, directoryID, leafName string) (string, bool, error) {
 	// Get token
-	token, err := f.tokenSource.Token()
+	_, err := f.tokenSource.Token()
 	if err != nil {
 		return "", false, err
 	}
+
 	var nextOffset = 0
 	for {
-		req := &api.GetFileListRequest{
-			CID:     directoryID,
-			Limit:   defaultLimit,
-			Offset:  nextOffset,
-			StDir:   1,
-			ShowDir: 1,
-			Cur:     1,
-		}
-		resp, err := f.client.GetFileList(ctx, token, req)
+		resp, err := f.getFileList(ctx, directoryID, defaultLimit, nextOffset)
 		if err != nil {
 			return "", false, err
 		}
 		for _, item := range resp.Data {
 			if item.FN == leafName {
-				return item.FID, item.FC == "0", nil // Return ID and whether it's a directory
+				return item.FID, item.FC == objectDir, nil // Return ID and whether it's a directory
 			}
 		}
 		// If the returned count is less than the requested count, we have reached the end.
@@ -245,17 +238,78 @@ func (f *Fs) FindLeaf(ctx context.Context, directoryID, leafName string) (string
 // CreateDir creates the directory named dirName in the directory with directoryID.
 func (f *Fs) CreateDir(ctx context.Context, dirID, dirName string) (string, error) {
 	// Get token
-	token, err := f.tokenSource.Token()
+	_, err := f.tokenSource.Token()
 	if err != nil {
 		return "", err
 	}
 	// Create the directory
-	resp, err := f.client.CreateFolder(ctx, token, dirID, dirName)
+	resp, err := f.createFolder(ctx, dirID, dirName)
 	if err != nil {
 		return "", err
 	}
 
 	return resp.Data.FileID.String(), nil
+}
+
+// List the objects and directories in dir into entries.  The
+// entries can be returned in any order but should be for a
+// complete directory.
+//
+// dir should be "" to list the root, and should not have
+// trailing slashes.
+//
+// This should return ErrDirNotFound if the directory isn't
+// found.
+func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
+	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = f.tokenSource.Token()
+	if err != nil {
+		return nil, err
+	}
+
+	var nextOffset = 0
+	var fileList []api.FileInfo
+
+	// Get all files page by page
+	for {
+		resp, err := f.getFileList(ctx, directoryID, defaultLimit, nextOffset)
+		if err != nil {
+			return nil, err
+		}
+
+		fileList = append(fileList, resp.Data...)
+
+		// If the returned count is less than the requested count, we have reached the end.
+		if len(resp.Data) < defaultLimit {
+			break
+		}
+
+		nextOffset += defaultLimit
+	}
+
+	entries = make([]fs.DirEntry, 0, len(fileList))
+	for _, item := range fileList {
+		remote := path.Join(dir, item.FN)
+		if item.FC == objectDir { // Folder
+			// Cache directory ID
+			f.dirCache.Put(remote, item.FID)
+			d := fs.NewDir(remote, time.Unix(int64(item.UPT), 0))
+			entries = append(entries, d)
+		} else {
+			o, err := f.newObjectWithInfo(ctx, remote, &item)
+			if err != nil {
+				fs.Debugf(o, "list error parsing file info: %v", err)
+				continue // Skip problematic files
+			}
+			entries = append(entries, o)
+		}
+	}
+
+	return entries, nil
 }
 
 // NewObject finds the Object at remote. It returns fs.ErrorNotFound if the object isn't present.
@@ -288,82 +342,14 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 	return o, nil
 }
 
-// List the objects and directories in the specified directory.
-func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
-	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
-	if err != nil {
-		return nil, err
-	}
-
-	token, err := f.tokenSource.Token()
-	if err != nil {
-		return nil, err
-	}
-
-	var nextOffset = 0
-	var fileList []api.FileInfo
-
-	// Get all files page by page
-	for {
-		req := &api.GetFileListRequest{
-			CID:     directoryID,
-			Limit:   defaultLimit,
-			Offset:  nextOffset,
-			ShowDir: 1, // Show directories
-			StDir:   1, // Show folders when filtering files
-			Cur:     1, // Show current directory only
-		}
-
-		resp, err := f.client.GetFileList(ctx, token, req)
-		if err != nil {
-			return nil, err
-		}
-
-		fileList = append(fileList, resp.Data...)
-
-		// If the returned count is less than the requested count, we have reached the end.
-		if len(resp.Data) < defaultLimit {
-			break
-		}
-
-		nextOffset += defaultLimit
-	}
-
-	entries = make([]fs.DirEntry, 0, len(fileList))
-	for _, item := range fileList {
-		remote := path.Join(dir, item.FN)
-		if item.FC == "0" { // Folder
-			// Cache directory ID
-			f.dirCache.Put(remote, item.FID)
-			d := fs.NewDir(remote, time.Unix(int64(item.UPT), 0))
-			entries = append(entries, d)
-		} else {
-			o, err := f.newObjectWithInfo(ctx, remote, &item)
-			if err != nil {
-				fs.Debugf(o, "list error parsing file info: %v", err)
-				continue // Skip problematic files
-			}
-			entries = append(entries, o)
-		}
-	}
-
-	return entries, nil
-}
-
 // Put uploads the object
 //
 // Copy the reader data to the object specified by remote.
 //
-// The reader provided will be drained of data as it is read.
-//
-// If src is nil, the source object is unknown.
-//
-// Returns the new object created and error if any.
-//
-// See Put in the Operations interface for full documentation.
+// It returns the object created and an error, if any.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	// Get access token
-	token, err := f.tokenSource.Token()
+	_, err := f.tokenSource.Token()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get access token: %w", err)
 	}
@@ -397,12 +383,10 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 
 	// 执行文件上传
 	// Execute file upload
-	return f.upload(ctx, in, token, remote, directoryID, size)
+	return f.upload(ctx, in, remote, directoryID, size)
 }
 
-// Mkdir creates the directory.
-//
-// See Mkdir in the Operations interface for documentation.
+// Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
@@ -410,7 +394,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 
 // Rmdir removes the directory.
 //
-// See Rmdir in the Operations interface for documentation.
+// Returns an error if it isn't empty
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	dirID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
@@ -418,21 +402,12 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	// Check if the directory is empty
-	token, err := f.tokenSource.Token()
+	_, err = f.tokenSource.Token()
 	if err != nil {
 		return err
 	}
 
-	req := &api.GetFileListRequest{
-		CID:     dirID,
-		Limit:   1, // We only need to know if there's at least one item
-		Offset:  0,
-		ShowDir: 1, // Show directories
-		StDir:   1, // Show folders when filtering files
-		Cur:     1, // Show current directory only
-	}
-
-	resp, err := f.client.GetFileList(ctx, token, req)
+	resp, err := f.getFileList(ctx, dirID, 1, 0)
 	if err != nil {
 		return err
 	}
@@ -442,7 +417,7 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	}
 
 	// Delete directory
-	_, err = f.client.DeleteFiles(ctx, token, []string{dirID}, "")
+	_, err = f.deleteFiles(ctx, []string{dirID}, "")
 	if err != nil {
 		return err
 	}
@@ -461,20 +436,38 @@ func (f *Fs) Hashes() hash.Set {
 	return hash.Set(hash.SHA1)
 }
 
-// About gets quota information.
-//
-// See About in the Operations interface for documentation.
-func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
-	// Not implemented yet
-	return nil, fs.ErrorNotImplemented
+// About gets quota information
+func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
+	_, err = f.tokenSource.Token()
+	if err != nil {
+		return nil, err
+	}
+	userInfo, err := f.getUserInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	total, _ := userInfo.Data.RTSpaceInfo.AllTotal.Size.Int64()
+	used, _ := userInfo.Data.RTSpaceInfo.AllUse.Size.Int64()
+	free, _ := userInfo.Data.RTSpaceInfo.AllRemain.Size.Int64()
+	usage = &fs.Usage{
+		Total: fs.NewUsageValue(total),
+		Used:  fs.NewUsageValue(used),
+		Free:  fs.NewUsageValue(free),
+	}
+	return usage, nil
 }
 
 // ---------------------------------------------------------------------------
 
+// ID returns the ID of the object.
+func (o *Object) ID() string {
+	return o.id
+}
+
 // setMetaData sets the metadata from info.
 func (o *Object) setMetaData(info *api.FileInfo) error {
 	// Ensure it's not a directory
-	if info.FC == "0" {
+	if info.FC == objectDir {
 		return fs.ErrorIsDir
 	}
 
@@ -508,42 +501,27 @@ func (o *Object) readMetaData(ctx context.Context) error {
 		return err
 	}
 	// Get token
-	token, err := o.fs.tokenSource.Token()
+	_, err = o.fs.tokenSource.Token()
 	if err != nil {
 		return err
 	}
 
-	// List files in the directory, looking for a match
-	req := &api.GetFileListRequest{
-		CID:     directoryID,
-		Limit:   defaultLimit, // Need to list potentially many files
-		Offset:  0,
-		ShowDir: 1, // Show directories
-		StDir:   1, // Show folders when filtering files
-		Cur:     1, // Show current directory only
-	}
-
 	var nextOffset = 0
 	for {
-		req.Offset = nextOffset
-		resp, err := o.fs.client.GetFileList(ctx, token, req)
+		resp, err := o.fs.getFileList(ctx, directoryID, defaultLimit, nextOffset)
 		if err != nil {
 			return err
 		}
-
-		// 在当前页中查找匹配的文件
 		// Search for matching files in the current page
 		for _, item := range resp.Data {
 			if item.FN == leaf {
 				return o.setMetaData(&item)
 			}
 		}
-		// 如果返回的数量少于请求的限制，表示已经到达最后一页
 		// If the returned count is less than the requested limit, it means we've reached the last page
 		if len(resp.Data) < defaultLimit {
 			break
 		}
-		// 更新下一页的偏移量
 		// Update the offset for the next page
 		nextOffset += defaultLimit
 	}
@@ -555,27 +533,33 @@ func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
-// Remote returns the remote path.
+// Remote returns the remote path
 func (o *Object) Remote() string {
 	return o.remote
 }
 
-// String returns the remote path.
+// String returns a string version
 func (o *Object) String() string {
+	if o == nil {
+		return "<nil>"
+	}
 	return o.remote
 }
 
-// ModTime returns the modification time.
+// ModTime returns the modification time of the object
+//
+// It attempts to read the objects modTime and if that isn't present the
+// LastModified returned in the http headers
 func (o *Object) ModTime(ctx context.Context) time.Time {
 	return o.modTime
 }
 
-// SetModTime sets the modification time (not supported).
+// SetModTime sets the modification time of the local fs object
 func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
-// Size returns the file size.
+// Size returns the file size in bytes
 func (o *Object) Size() int64 {
 	return o.size
 }
@@ -585,18 +569,18 @@ func (o *Object) Storable() bool {
 	return true
 }
 
-// Open opens the file for reading.
+// Open an object for read
 //
 // See Open in the Object interface for documentation.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	// Get token
-	token, err := o.fs.tokenSource.Token()
+	_, err := o.fs.tokenSource.Token()
 	if err != nil {
 		return nil, err
 	}
 
 	// Get download URL
-	resp, err := o.fs.client.GetFileDownloadURL(ctx, token, o.pickCode)
+	resp, err := o.fs.getFileDownloadURL(ctx, o.pickCode)
 	if err != nil {
 		return nil, fmt.Errorf("[Open] failed to get download URL: %w", err)
 	}
@@ -613,10 +597,14 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	if fileInfo.URL.URL == "" {
 		return nil, fmt.Errorf("[Open] could not find download URL for file id %s in API response", o.id)
 	}
-	return o.fs.client.Open(ctx, fileInfo.URL.URL, options...)
+	return o.fs.download(ctx, fileInfo.URL.URL, options...)
 }
 
-// Update updates the file content
+// Update the object with the contents of the io.Reader, modTime and size
+//
+// If existing is set then it updates the object rather than creating a new one.
+//
+// The new object may have been created if an error is returned.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	// Directly call Put to implement the update functionality
 	newObj, err := o.fs.Put(ctx, in, src, options...)
@@ -636,7 +624,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	return nil
 }
 
-// Hash returns the requested hash Type.
+// Hash returns the SHA-1 of an object returning a lowercase hex string
 //
 // See Hash in the Object interface for documentation.
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
@@ -646,24 +634,31 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	return "", hash.ErrUnsupported
 }
 
-// Remove removes the object.
+// Remove an object
 //
 // See Remove in the Object interface for documentation.
 func (o *Object) Remove(ctx context.Context) error {
 	// Get token
-	token, err := o.fs.tokenSource.Token()
+	_, err := o.fs.tokenSource.Token()
 	if err != nil {
 		return err
 	}
 
 	// Delete file
-	_, err = o.fs.client.DeleteFiles(ctx, token, []string{o.id}, "")
+	_, err = o.fs.deleteFiles(ctx, []string{o.id}, "")
 	return err
 }
 
 // ---------------------------------------------------------------------------
 
-// DirMove moves srcRemote to dstRemote for directories.
+// DirMove moves src, srcRemote to this remote at dstRemote
+// using server-side move operations.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantDirMove
+//
+// If destination exists then return fs.ErrorDirExists
 func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
 	srcFs, ok := src.(*Fs)
 	if !ok {
@@ -687,7 +682,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	}
 
 	// Get token
-	token, err := f.tokenSource.Token()
+	_, err = f.tokenSource.Token()
 	if err != nil {
 		return err
 	}
@@ -696,12 +691,12 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if srcFs == f && path.Dir(srcRemote) == path.Dir(dstRemote) {
 		// Rename directory
 		newName := path.Base(dstRemote)
-		_, err = f.client.UpdateFile(ctx, token, srcDirID, map[string]string{
+		_, err = f.updateFile(ctx, srcDirID, map[string]string{
 			"file_name": newName,
 		})
 	} else {
 		// Move directory
-		_, err = f.client.MoveFiles(ctx, token, []string{srcDirID}, dstDirID)
+		_, err = f.moveFiles(ctx, []string{srcDirID}, dstDirID)
 	}
 	if err != nil {
 		return err
@@ -713,9 +708,15 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return nil
 }
 
-// Copy copies the file.
+// Copy src to this remote using server-side copy operations.
 //
-// See Copy in the Operations interface for documentation.
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantCopy
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -733,13 +734,13 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Get token
-	token, err := f.tokenSource.Token()
+	_, err = f.tokenSource.Token()
 	if err != nil {
 		return nil, err
 	}
 
 	// Copy file
-	_, err = f.client.CopyFiles(ctx, token, dstDirID, []string{srcObj.id}, false)
+	_, err = f.copyFiles(ctx, dstDirID, []string{srcObj.id}, false)
 	if err != nil {
 		return nil, err
 	}
@@ -751,9 +752,15 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return f.NewObject(ctx, remote)
 }
 
-// Move moves the file.
+// Move src to this remote using server-side move operations.
 //
-// See Move in the Operations interface for documentation.
+// This is stored with the remote path given.
+//
+// It returns the destination Object and a possible error.
+//
+// Will only be called if src.Fs().Name() == f.Name()
+//
+// If it isn't possible then return fs.ErrorCantMove
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -771,13 +778,13 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Get token
-	token, err := f.tokenSource.Token()
+	_, err = f.tokenSource.Token()
 	if err != nil {
 		return nil, err
 	}
 
 	// Move file
-	_, err = f.client.MoveFiles(ctx, token, []string{srcObj.id}, dstDirID)
+	_, err = f.moveFiles(ctx, []string{srcObj.id}, dstDirID)
 	if err != nil {
 		return nil, err
 	}
@@ -789,7 +796,8 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	return f.NewObject(ctx, remote)
 }
 
-// DirCacheFlush flushes the directory cache.
+// DirCacheFlush flushes the directory cache - used in testing as an
+// optional interface
 func (f *Fs) DirCacheFlush() {
 	f.dirCache.ResetRoot()
 }
@@ -801,30 +809,13 @@ func (f *Fs) CleanUp(ctx context.Context) error {
 
 // OAuth performs the OAuth flow to get a token, implementing config.Configurer.
 func (f *Fs) OAuth(ctx context.Context, name string, m configmap.Mapper, oauthConfig *fs.ConfigOut) error {
-	// Get QR code URL
-	authData, err := getAuthURL(ctx, f.client)
+	opt := new(Options)
+	err := configstruct.Set(m, opt)
 	if err != nil {
 		return err
 	}
-
-	// Display QR code URL for user to scan
-	fs.Logf(nil, "Please use the 115 mobile app to scan the QR code: %s", authData.QRCode)
-
-	// Wait for user to scan and confirm authorization
-	token, err := waitForQRCodeScan(ctx, f.client, authData)
-	if err != nil {
-		return err
-	}
-
-	// Save token to config
-	tokenJSON, err := json.Marshal(token)
-	if err != nil {
-		return err
-	}
-	m.Set("token", string(tokenJSON))
-
-	fs.Logf(nil, "Authorization successful, token saved.")
-	return nil
+	appId := opt.AppID
+	return f.tokenSource.Auth(appId)
 }
 
 // Config handles the configuration process.
@@ -843,8 +834,9 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 		}
 	case "token":
 		// Use TokenSource to save token
+		fc := fshttp.NewClient(ctx)
 		ts := &TokenSource{
-			client: f.client,
+			c: rest.NewClient(fc),
 			token: &api.Token{
 				RefreshToken: config.Result,
 			},
@@ -858,32 +850,28 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 		}
 		return &fs.ConfigOut{State: ""}, nil
 	case "auth":
-		// Get QR code URL
-		authData, err := getAuthURL(ctx, f.client)
+		opt := new(Options)
+		err := configstruct.Set(m, opt)
 		if err != nil {
 			return nil, err
 		}
-
-		// Display QR code URL for user to scan
-		fs.Logf(nil, "Please use the 115 mobile app to scan the QR code: %s", authData.QRCode)
-
-		// Wait for user to scan and confirm authorization
-		token, err := waitForQRCodeScan(ctx, f.client, authData)
-		if err != nil {
-			return nil, err
-		}
+		appId := func() string {
+			if opt.AppID != "" {
+				return opt.AppID
+			}
+			return defaultAppId
+		}()
 		// Use TokenSource to save token
+		fc := fshttp.NewClient(ctx)
 		ts := &TokenSource{
-			client: f.client,
-			token:  token,
-			ctx:    ctx,
-			name:   name,
-			m:      m,
+			c:    rest.NewClient(fc),
+			ctx:  ctx,
+			name: name,
+			m:    m,
 		}
-		// Call saveToken to save the token
-		err = ts.saveToken()
+		err = ts.Auth(appId)
 		if err != nil {
-			return nil, fmt.Errorf("failed to save token: %v", err)
+			return nil, fmt.Errorf("failed to authenticate: %v", err)
 		}
 		return &fs.ConfigOut{State: ""}, nil
 	}
@@ -931,7 +919,7 @@ func getOssRegion(endpoint string) string {
 
 // uploadToOSS uploads a file to Alibaba Cloud OSS
 func uploadToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData, token api.UploadTokenData) error {
-	// Create OSS client
+	// Create OSS c
 	provider := credentials.NewStaticCredentialsProvider(token.AccessKeyId, token.AccessKeySecret, token.SecurityToken)
 	cfg := oss.LoadDefaultConfig().
 		WithRegion(getOssRegion(token.Endpoint)).
@@ -1083,7 +1071,7 @@ func calculateSHA1FromReadSeeker(rs io.ReadSeeker) (string, error) {
 }
 
 // initializeUpload initializes the upload process
-func (f *Fs) initializeUpload(ctx context.Context, accessToken, remote, directoryID string, size int64, fileSHA1 string, reader io.ReadSeeker) (*api.InitUploadData, error) {
+func (f *Fs) initializeUpload(ctx context.Context, remote, directoryID string, size int64, fileSHA1 string, reader io.ReadSeeker) (*api.InitUploadData, error) {
 	// Build upload initialization request
 	initReq := &api.InitUploadRequest{
 		FileName: path.Base(remote),
@@ -1093,7 +1081,7 @@ func (f *Fs) initializeUpload(ctx context.Context, accessToken, remote, director
 	}
 
 	// Execute upload initialization request
-	initResp, err := f.client.InitUpload(ctx, accessToken, initReq)
+	initResp, err := f.initUpload(ctx, initReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize upload: %w", err)
 	}
@@ -1132,7 +1120,7 @@ func (f *Fs) initializeUpload(ctx context.Context, accessToken, remote, director
 		initReq.SignVal = sha1Value
 
 		// Resend initialization request
-		initResp, err = f.client.InitUpload(ctx, accessToken, initReq)
+		initResp, err = f.initUpload(ctx, initReq)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize upload with authentication: %w", err)
 		}
@@ -1180,7 +1168,7 @@ func prepareFileForUpload(in io.Reader, size int64) (reader io.ReadSeeker, sha1H
 }
 
 // upload handles the file upload process
-func (f *Fs) upload(ctx context.Context, in io.Reader, accessToken string, remote string,
+func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 	directoryID string, size int64) (fs.Object, error) {
 
 	// Handle empty files
@@ -1197,7 +1185,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, accessToken string, remot
 	defer cleanup()
 
 	// Initialize upload
-	initData, err := f.initializeUpload(ctx, accessToken, remote, directoryID, size, fileSHA1, reader)
+	initData, err := f.initializeUpload(ctx, remote, directoryID, size, fileSHA1, reader)
 	if err != nil {
 		fs.Errorf(nil, "failed to initialize upload: %+v", err)
 		return nil, err
@@ -1218,7 +1206,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, accessToken string, remot
 	}
 
 	// Get upload token for OSS
-	tokenResp, err := f.client.GetUploadToken(ctx, accessToken)
+	tokenResp, err := f.getUploadToken(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get upload token: %w", err)
 	}
@@ -1246,12 +1234,347 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, accessToken string, remot
 	})
 }
 
+func shouldRetry(ctx context.Context, res *http.Response, resp *api.Response, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	if resp != nil && resp.Errno != 0 {
+		return false, fserrors.NoRetryError(fmt.Errorf("API error: code=%d, message=%s", resp.Errno, resp.Error))
+	}
+	return fserrors.ShouldRetry(err) || fserrors.ShouldRetryHTTP(res, retryErrorCodes), err
+}
+
+// download starts a download from the given URL and returns the response body reader
+func (f *Fs) download(ctx context.Context, url string, options ...fs.OpenOption) (io.ReadCloser, error) {
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: url,
+	}
+	opts.Options = options
+	var resp *http.Response
+	err := f.pacer.Call(func() (bool, error) {
+		var err error
+		resp, err = f.client.Call(ctx, &opts)
+		return shouldRetry(ctx, resp, nil, err)
+	})
+	return resp.Body, err
+}
+
+// createFolder creates a new folder.
+func (f *Fs) createFolder(ctx context.Context, pid string, fileName string) (*api.FolderCreateResponse, error) {
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/download/folder/add",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(fmt.Sprintf("pid=%s&file_name=%s", pid, fileName)),
+	}
+	var resp api.FolderCreateResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// getFileList gets the list of files and folders.
+func (f *Fs) getFileList(ctx context.Context, cid string, limit, offset int) (*api.FileListResponse, error) {
+
+	// Build query parameters
+	params := url.Values{}
+	params.Set("cid", cid)
+	params.Set("limit", fmt.Sprintf("%d", limit))
+	params.Set("offset", fmt.Sprintf("%d", offset))
+	params.Set("cur", "1")
+	params.Set("stdir", "1")
+	params.Set("show_dir", "1")
+	opts := rest.Opts{
+		Method:     "GET",
+		RootURL:    baseAPI,
+		Path:       "/download/ufile/files",
+		Parameters: params,
+	}
+	var resp api.FileListResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// getFileInfo gets the details of a file or folder.
+func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*api.FileInfoResponse, error) {
+	opts := rest.Opts{
+		Method:     "GET",
+		RootURL:    baseAPI,
+		Path:       "/download/folder/get_info",
+		Parameters: url.Values{"file_id": []string{fileID}},
+	}
+
+	var resp api.FileInfoResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// getFileDownloadURL gets the download URL for a file.
+func (f *Fs) getFileDownloadURL(ctx context.Context, pickCode string) (*api.FileDownloadResponse, error) {
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/download/ufile/downurl",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(fmt.Sprintf("pick_code=%s", pickCode)),
+	}
+
+	var resp api.FileDownloadResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// deleteFiles deletes files or folders.
+func (f *Fs) deleteFiles(ctx context.Context, fileIDs []string, parentID string) (*api.FileOperationResponse, error) {
+	formData := fmt.Sprintf("file_ids=%s", strings.Join(fileIDs, ","))
+	if parentID != "" {
+		formData += fmt.Sprintf("&parent_id=%s", parentID)
+	}
+
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/download/ufile/delete",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(formData),
+	}
+
+	var resp api.FileOperationResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// updateFile updates file information (rename or star).
+func (f *Fs) updateFile(ctx context.Context, fileID string, options map[string]string) (*api.FileUpdateResponse, error) {
+	formData := fmt.Sprintf("file_id=%s", fileID)
+	for key, value := range options {
+		formData += fmt.Sprintf("&%s=%s", key, value)
+	}
+
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/download/ufile/update",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(formData),
+	}
+
+	var resp api.FileUpdateResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// copyFiles copies files.
+func (f *Fs) copyFiles(ctx context.Context, pid string, fileIDs []string, noDuplicate bool) (*api.FileOperationResponse, error) {
+	formData := fmt.Sprintf("pid=%s&file_id=%s", pid, strings.Join(fileIDs, ","))
+	if noDuplicate {
+		formData += "&nodupli=1"
+	}
+
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/download/ufile/copy",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(formData),
+	}
+
+	var resp api.FileOperationResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// moveFiles moves files.
+func (f *Fs) moveFiles(ctx context.Context, fileIDs []string, toCID string) (*api.FileOperationResponse, error) {
+	formData := fmt.Sprintf("file_ids=%s&to_cid=%s", strings.Join(fileIDs, ","), toCID)
+
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/download/ufile/move",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(formData),
+	}
+
+	var resp api.FileOperationResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// getUploadToken gets the upload token
+func (f *Fs) getUploadToken(ctx context.Context) (*api.UploadTokenResponse, error) {
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: baseAPI,
+		Path:    "/download/upload/get_token",
+	}
+
+	var resp api.UploadTokenResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// initUpload initializes file upload
+func (f *Fs) initUpload(ctx context.Context, req *api.InitUploadRequest) (*api.InitUploadResponse, error) {
+	// Build form data
+	formData := url.Values{}
+	formData.Set("file_name", req.FileName)
+	formData.Set("file_size", fmt.Sprintf("%d", req.FileSize))
+	formData.Set("target", req.Target)
+	formData.Set("fileid", req.FileID)
+
+	if req.PreID != "" {
+		formData.Set("preid", req.PreID)
+	}
+	if req.PickCode != "" {
+		formData.Set("pick_code", req.PickCode)
+	}
+	if req.TopUpload != 0 {
+		formData.Set("topupload", fmt.Sprintf("%d", req.TopUpload))
+	}
+	if req.SignKey != "" {
+		formData.Set("sign_key", req.SignKey)
+	}
+	if req.SignVal != "" {
+		formData.Set("sign_val", req.SignVal)
+	}
+
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/download/upload/init",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(formData.Encode()),
+	}
+
+	var resp api.InitUploadResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// resumeUpload handles resumable upload
+func (f *Fs) resumeUpload(ctx context.Context, req *api.ResumeUploadRequest) (*api.ResumeUploadResponse, error) {
+	// Build form data
+	formData := url.Values{}
+	formData.Set("file_size", fmt.Sprintf("%d", req.FileSize))
+	formData.Set("target", req.Target)
+	formData.Set("fileid", req.FileID)
+	formData.Set("pick_code", req.PickCode)
+
+	opts := rest.Opts{
+		Method:      "POST",
+		RootURL:     baseAPI,
+		Path:        "/download/upload/resume",
+		ContentType: "application/x-www-form-urlencoded",
+		Body:        strings.NewReader(formData.Encode()),
+	}
+
+	var resp api.ResumeUploadResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &resp, nil
+}
+
+// getUserInfo gets the user information including space usage and VIP status.
+func (f *Fs) getUserInfo(ctx context.Context) (*api.UserInfoResponse, error) {
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: baseAPI,
+		Path:    "/download/user/info",
+	}
+
+	var resp api.UserInfoResponse
+	err := f.pacer.Call(func() (bool, error) {
+		r, err := f.client.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, r, &resp.Response, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Interfaces implementation check
 var (
 	_ fs.Fs              = (*Fs)(nil)
 	_ fs.Mover           = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)
 	_ fs.Copier          = (*Fs)(nil)
+	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 )

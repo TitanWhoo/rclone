@@ -305,7 +305,7 @@ func (d *InitUploadData) GetCallback() (Callback, error) {
 		reflect.ValueOf(d.Callback).Len() == 0) {
 		return Callback{}, nil
 	}
-	return Callback{}, fmt.Errorf("无法解析callback字段: %v", d.Callback)
+	return Callback{}, fmt.Errorf("unsupported callback type: %v", d.Callback)
 }
 
 type Callback struct {
@@ -355,4 +355,40 @@ type UploadFileResponse struct {
 	IsFast      bool                 // IsFast indicates if fast upload was successful.
 	InitRes     *InitUploadResponse  // InitRes contains the initialization response.
 	UploadToken *UploadTokenResponse // UploadToken contains the upload credentials (only present if actual upload is needed).
+}
+
+// UserInfoResponse represents the response for getting user information.
+type UserInfoResponse struct {
+	Response
+	Data UserInfoData `json:"data"` // Data contains the user information.
+}
+
+// UserInfoData holds the user information data structure.
+type UserInfoData struct {
+	UserID      string    `json:"user_id"`       // UserID is the user identifier
+	UserName    string    `json:"user_name"`     // UserName is the username
+	UserFaceS   string    `json:"user_face_s"`   // UserFaceS is the small-sized user avatar
+	UserFaceM   string    `json:"user_face_m"`   // UserFaceM is the medium-sized user avatar
+	UserFaceL   string    `json:"user_face_l"`   // UserFaceL is the large-sized user avatar
+	RTSpaceInfo SpaceInfo `json:"rt_space_info"` // RTSpaceInfo contains the user's storage space information
+	VipInfo     VipInfo   `json:"vip_info"`      // VipInfo contains the user's VIP level information
+}
+
+// SpaceInfo represents the user's storage space information.
+type SpaceInfo struct {
+	AllTotal  SpaceSize `json:"all_total"`  // AllTotal is the user's total storage space
+	AllRemain SpaceSize `json:"all_remain"` // AllRemain is the user's remaining storage space
+	AllUse    SpaceSize `json:"all_use"`    // AllUse is the user's used storage space
+}
+
+// SpaceSize represents storage size information.
+type SpaceSize struct {
+	Size       json.Number `json:"size"`        // Size is the space size in bytes
+	SizeFormat string      `json:"size_format"` // SizeFormat is the formatted space size
+}
+
+// VipInfo represents the user's VIP level information.
+type VipInfo struct {
+	LevelName string      `json:"level_name"` // LevelName is the VIP level name; e.g., Basic Member, Trial VIP, Monthly VIP, Annual VIP, Super VIP, Long-term VIP
+	Expire    json.Number `json:"expire"`     // Expire is the expiration timestamp
 }
