@@ -209,11 +209,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 // FindLeaf finds a file or directory named leaf in the directory directoryID.
 func (f *Fs) FindLeaf(ctx context.Context, directoryID, leafName string) (string, bool, error) {
-	// Get token
-	_, err := f.tokenSource.Token()
-	if err != nil {
-		return "", false, err
-	}
 
 	var nextOffset = 0
 	for {
@@ -237,11 +232,6 @@ func (f *Fs) FindLeaf(ctx context.Context, directoryID, leafName string) (string
 
 // CreateDir creates the directory named dirName in the directory with directoryID.
 func (f *Fs) CreateDir(ctx context.Context, dirID, dirName string) (string, error) {
-	// Get token
-	_, err := f.tokenSource.Token()
-	if err != nil {
-		return "", err
-	}
 	// Create the directory
 	resp, err := f.createFolder(ctx, dirID, dirName)
 	if err != nil {
@@ -262,11 +252,6 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, dirName string) (string, erro
 // found.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
-	if err != nil {
-		return nil, err
-	}
-
-	_, err = f.tokenSource.Token()
 	if err != nil {
 		return nil, err
 	}
@@ -348,11 +333,6 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 //
 // It returns the object created and an error, if any.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Get access token
-	_, err := f.tokenSource.Token()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get access token: %w", err)
-	}
 	// Get file path and size
 	remote := src.Remote()
 	size := src.Size()
@@ -401,12 +381,6 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return err
 	}
 
-	// Check if the directory is empty
-	_, err = f.tokenSource.Token()
-	if err != nil {
-		return err
-	}
-
 	resp, err := f.getFileList(ctx, dirID, 1, 0)
 	if err != nil {
 		return err
@@ -438,10 +412,6 @@ func (f *Fs) Hashes() hash.Set {
 
 // About gets quota information
 func (f *Fs) About(ctx context.Context) (usage *fs.Usage, err error) {
-	_, err = f.tokenSource.Token()
-	if err != nil {
-		return nil, err
-	}
 	userInfo, err := f.getUserInfo(ctx)
 	if err != nil {
 		return nil, err
@@ -500,12 +470,6 @@ func (o *Object) readMetaData(ctx context.Context) error {
 		}
 		return err
 	}
-	// Get token
-	_, err = o.fs.tokenSource.Token()
-	if err != nil {
-		return err
-	}
-
 	var nextOffset = 0
 	for {
 		resp, err := o.fs.getFileList(ctx, directoryID, defaultLimit, nextOffset)
@@ -573,12 +537,6 @@ func (o *Object) Storable() bool {
 //
 // See Open in the Object interface for documentation.
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
-	// Get token
-	_, err := o.fs.tokenSource.Token()
-	if err != nil {
-		return nil, err
-	}
-
 	// Get download URL
 	resp, err := o.fs.getFileDownloadURL(ctx, o.pickCode)
 	if err != nil {
@@ -638,14 +596,8 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 //
 // See Remove in the Object interface for documentation.
 func (o *Object) Remove(ctx context.Context) error {
-	// Get token
-	_, err := o.fs.tokenSource.Token()
-	if err != nil {
-		return err
-	}
-
 	// Delete file
-	_, err = o.fs.deleteFiles(ctx, []string{o.id}, "")
+	_, err := o.fs.deleteFiles(ctx, []string{o.id}, "")
 	return err
 }
 
@@ -677,12 +629,6 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		dstDir = ""
 	}
 	dstDirID, err := f.dirCache.FindDir(ctx, dstDir, true)
-	if err != nil {
-		return err
-	}
-
-	// Get token
-	_, err = f.tokenSource.Token()
 	if err != nil {
 		return err
 	}
@@ -733,12 +679,6 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
-	// Get token
-	_, err = f.tokenSource.Token()
-	if err != nil {
-		return nil, err
-	}
-
 	// Copy file
 	_, err = f.copyFiles(ctx, dstDirID, []string{srcObj.id}, false)
 	if err != nil {
@@ -773,12 +713,6 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		dstDir = ""
 	}
 	dstDirID, err := f.dirCache.FindDir(ctx, dstDir, true)
-	if err != nil {
-		return nil, err
-	}
-
-	// Get token
-	_, err = f.tokenSource.Token()
 	if err != nil {
 		return nil, err
 	}
