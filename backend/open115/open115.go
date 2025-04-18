@@ -1,5 +1,4 @@
-// Package open115 provides an interface to the 115网盘 storage system.
-// Package open115 provides an interface to the 115 Cloud Storage system.
+// Package open115 provides an interface to the 115 Cloud Storage
 package open115
 
 import (
@@ -35,7 +34,7 @@ import (
 )
 
 const (
-	defaultAppId  = "100196879"
+	defaultAppId  = "100196955"            // default app id for rclone
 	minSleep      = 100 * time.Millisecond // minSleep is the minimum sleep time between retries.
 	maxSleep      = 5 * time.Second        // maxSleep is the maximum sleep time between retries.
 	decayConstant = 2                      // decayConstant is the backoff factor.
@@ -52,22 +51,33 @@ func init() {
 func Register(fName string) {
 	fs.Register(&fs.RegInfo{
 		Name:        fName,
-		Description: "Open 115 Drive",
+		Description: "Open 115 Cloud Drive",
 		NewFs:       NewFs,
 		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
+			fc := fshttp.NewClient(ctx)
+			rc := rest.NewClient(fc)
+
 			token, _ := m.Get("token")
 			var apiToken api.Token
 			err := json.Unmarshal([]byte(token), &apiToken)
-			if err == nil && apiToken.RefreshToken != "" {
-				return &fs.ConfigOut{}, nil
+			if err != nil {
+				return nil, err
+			}
+			ts := &TokenSource{
+				name:  name,
+				ctx:   ctx,
+				token: &apiToken,
+			}
+			// check if token is already present and valid
+			if _, err = ts.Token(); err == nil {
+				// token is valid, no need to re-authenticate
+				return &fs.ConfigOut{State: ""}, nil
 			}
 			opt := new(Options)
 			err = configstruct.Set(m, opt)
 			if err != nil {
 				return nil, err
 			}
-			fc := fshttp.NewClient(ctx)
-			rc := rest.NewClient(fc)
 			f := &Fs{
 				name:   name,
 				opt:    *opt,
