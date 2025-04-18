@@ -1199,7 +1199,7 @@ func (f *Fs) createFolder(ctx context.Context, pid string, fileName string) (*ap
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
-		Path:        "/download/folder/add",
+		Path:        "/open/folder/add",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(fmt.Sprintf("pid=%s&file_name=%s", pid, fileName)),
 	}
@@ -1228,7 +1228,7 @@ func (f *Fs) getFileList(ctx context.Context, cid string, limit, offset int) (*a
 	opts := rest.Opts{
 		Method:     "GET",
 		RootURL:    baseAPI,
-		Path:       "/download/ufile/files",
+		Path:       "/open/ufile/files",
 		Parameters: params,
 	}
 	var resp api.FileListResponse
@@ -1247,7 +1247,7 @@ func (f *Fs) getFileInfo(ctx context.Context, fileID string) (*api.FileInfoRespo
 	opts := rest.Opts{
 		Method:     "GET",
 		RootURL:    baseAPI,
-		Path:       "/download/folder/get_info",
+		Path:       "/open/folder/get_info",
 		Parameters: url.Values{"file_id": []string{fileID}},
 	}
 
@@ -1268,7 +1268,7 @@ func (f *Fs) getFileDownloadURL(ctx context.Context, pickCode string) (*api.File
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
-		Path:        "/download/ufile/downurl",
+		Path:        "/open/ufile/downurl",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(fmt.Sprintf("pick_code=%s", pickCode)),
 	}
@@ -1295,7 +1295,7 @@ func (f *Fs) deleteFiles(ctx context.Context, fileIDs []string, parentID string)
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
-		Path:        "/download/ufile/delete",
+		Path:        "/open/ufile/delete",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(formData),
 	}
@@ -1322,7 +1322,7 @@ func (f *Fs) updateFile(ctx context.Context, fileID string, options map[string]s
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
-		Path:        "/download/ufile/update",
+		Path:        "/open/ufile/update",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(formData),
 	}
@@ -1349,7 +1349,7 @@ func (f *Fs) copyFiles(ctx context.Context, pid string, fileIDs []string, noDupl
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
-		Path:        "/download/ufile/copy",
+		Path:        "/open/ufile/copy",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(formData),
 	}
@@ -1373,7 +1373,7 @@ func (f *Fs) moveFiles(ctx context.Context, fileIDs []string, toCID string) (*ap
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
-		Path:        "/download/ufile/move",
+		Path:        "/open/ufile/move",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(formData),
 	}
@@ -1394,7 +1394,7 @@ func (f *Fs) getUploadToken(ctx context.Context) (*api.UploadTokenResponse, erro
 	opts := rest.Opts{
 		Method:  "GET",
 		RootURL: baseAPI,
-		Path:    "/download/upload/get_token",
+		Path:    "/open/upload/get_token",
 	}
 
 	var resp api.UploadTokenResponse
@@ -1437,7 +1437,7 @@ func (f *Fs) initUpload(ctx context.Context, req *api.InitUploadRequest) (*api.I
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
-		Path:        "/download/upload/init",
+		Path:        "/open/upload/init",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(formData.Encode()),
 	}
@@ -1466,7 +1466,7 @@ func (f *Fs) resumeUpload(ctx context.Context, req *api.ResumeUploadRequest) (*a
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
-		Path:        "/download/upload/resume",
+		Path:        "/open/upload/resume",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(formData.Encode()),
 	}
@@ -1488,7 +1488,7 @@ func (f *Fs) getUserInfo(ctx context.Context) (*api.UserInfoResponse, error) {
 	opts := rest.Opts{
 		Method:  "GET",
 		RootURL: baseAPI,
-		Path:    "/download/user/info",
+		Path:    "/open/user/info",
 	}
 
 	var resp api.UserInfoResponse
