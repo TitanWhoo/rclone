@@ -138,7 +138,7 @@ func (ts *TokenSource) refreshToken() error {
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     passportAPI,
-		Path:        "/download/refreshToken",
+		Path:        "/open/refreshToken",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(fmt.Sprintf("refresh_token=%s", ts.token.RefreshToken)),
 	}
@@ -204,7 +204,7 @@ func (ts *TokenSource) getAuthURL(ctx context.Context, appId string) (authData *
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     passportAPI,
-		Path:        "/download/authDeviceCode",
+		Path:        "/open/authDeviceCode",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(fmt.Sprintf("client_id=%s&code_challenge=%s&code_challenge_method=sha256", appId, codeChallenge)),
 	}
@@ -286,7 +286,7 @@ func (ts *TokenSource) codeToToken(ctx context.Context, authData *api.AuthDevice
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     passportAPI,
-		Path:        "/download/deviceCodeToToken",
+		Path:        "/open/deviceCodeToToken",
 		ContentType: "application/x-www-form-urlencoded",
 		Body:        strings.NewReader(fmt.Sprintf("uid=%s&code_verifier=%s", authData.UID, authData.CodeVerifier)),
 	}
