@@ -22,6 +22,12 @@ import (
 
 // ErrQRCodeTimeout is the error returned when QR code scanning times out
 var ErrQRCodeTimeout = fmt.Errorf("QR code scanning timeout, please run configuration again")
+var ErrTokenExpired = fmt.Errorf("token expired, please run configuration again")
+
+const (
+	errorCodeRefreshTokenExpired = 40140119
+	errorCodeRefreshTokenInvalid = 40140120
+)
 
 // OAuth related constants
 const (
@@ -144,8 +150,16 @@ func (ts *TokenSource) refreshToken() error {
 	}
 	var resp api.TokenResponse
 	_, err := ts.c.CallJSON(ts.ctx, &opts, nil, &resp)
-	if err != nil || resp.Data.AccessToken == "" {
+	if err != nil {
 		return fmt.Errorf("failed to refresh token: %v", err)
+	}
+	// token expired
+	if resp.Code == errorCodeRefreshTokenExpired || resp.Code == errorCodeRefreshTokenInvalid {
+		// Clear token
+		ts.token = nil
+		ts.expiry = time.Time{}
+		err = ts.saveToken()
+		return fmt.Errorf("refresh token expired, please run 'rclone config reconnect %s:'", ts.name)
 	}
 	// Update token
 	ts.token.AccessToken = resp.Data.AccessToken
