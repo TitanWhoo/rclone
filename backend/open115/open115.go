@@ -1206,12 +1206,15 @@ func (f *Fs) download(ctx context.Context, url string, options ...fs.OpenOption)
 
 // createFolder creates a new folder.
 func (f *Fs) createFolder(ctx context.Context, pid string, fileName string) (*api.FolderCreateResponse, error) {
+	values := url.Values{}
+	values.Set("pid", pid)
+	values.Set("file_name", fileName)
 	opts := rest.Opts{
 		Method:      "POST",
 		RootURL:     baseAPI,
 		Path:        "/open/folder/add",
 		ContentType: "application/x-www-form-urlencoded",
-		Body:        strings.NewReader(fmt.Sprintf("pid=%s&file_name=%s", pid, fileName)),
+		Body:        strings.NewReader(values.Encode()),
 	}
 	var resp api.FolderCreateResponse
 	err := f.pacer.Call(func() (bool, error) {
