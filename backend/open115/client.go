@@ -3,16 +3,19 @@ package open115
 import (
 	"context"
 	"fmt"
+	"golang.org/x/time/rate"
 	"net/http"
 
 	"github.com/rclone/rclone/lib/rest"
 )
 
 const (
-	baseAPI      = "https://proapi.115.com"
-	passportAPI  = "https://passportapi.115.com"
-	qrcodeAPI    = "https://qrcodeapi.115.com"
-	defaultLimit = 1000 // Default limit for listing items
+	baseAPI          = "https://proapi.115.com"
+	passportAPI      = "https://passportapi.115.com"
+	qrcodeAPI        = "https://qrcodeapi.115.com"
+	defaultRateLimit = 3    // Default rate limit for API calls
+	defaultBurst     = 5    // Default burst size for rate limiting
+	defaultLimit     = 1000 // Default limit for listing items
 )
 
 var retryErrorCodes = []int{
@@ -27,14 +30,16 @@ var retryErrorCodes = []int{
 // client is a wrapper around rest.Client to handle 115 Cloud Drive API calls.
 type client struct {
 	*rest.Client
-	ts *TokenSource
+	ts      *TokenSource
+	limiter *rate.Limiter
 }
 
 // newClient creates a new API client.
 func newClient(rc *rest.Client, ts *TokenSource) *client {
 	return &client{
-		Client: rc,
-		ts:     ts,
+		Client:  rc,
+		ts:      ts,
+		limiter: rate.NewLimiter(rate.Limit(defaultRateLimit), defaultBurst),
 	}
 }
 
@@ -46,6 +51,9 @@ func (c *client) CallJSON(ctx context.Context, opts *rest.Opts, request any, res
 	// use access token from TokenSource
 	if opts.ExtraHeaders == nil {
 		opts.ExtraHeaders = make(map[string]string)
+	}
+	if err = c.limiter.Wait(ctx); err != nil {
+		return nil, err
 	}
 	token, err := c.ts.Token()
 	if err != nil {
