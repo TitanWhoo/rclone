@@ -250,6 +250,15 @@ func (f *Fs) CreateDir(ctx context.Context, dirID, dirName string) (string, erro
 	// Create the directory
 	resp, err := f.createFolder(ctx, dirID, dirName)
 	if err != nil {
+		// Check if it's an error that the directory already exists
+		// If so, try to find the existing directory
+		if strings.Contains(err.Error(), "already exists") || strings.Contains(err.Error(), "exist") {
+			// Try to find the existing directory
+			existingID, found, findErr := f.FindLeaf(ctx, dirID, dirName)
+			if findErr == nil && found {
+				return existingID, nil
+			}
+		}
 		return "", err
 	}
 
@@ -342,29 +351,60 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 	return o, nil
 }
 
+// createObject creates a new Object for upload
+//
+// Used to create new objects
+func (f *Fs) createObject(ctx context.Context, remote string, modTime time.Time, size int64) (o *Object, leaf string, directoryID string, err error) {
+	// Create the directory for the object if it doesn't exist
+	leaf, directoryID, err = f.dirCache.FindPath(ctx, remote, true)
+	if err != nil {
+		return nil, leaf, directoryID, err
+	}
+	// Temporary Object under construction
+	o = &Object{
+		fs:     f,
+		remote: remote,
+	}
+	return o, leaf, directoryID, nil
+}
+
 // Put uploads the object
 //
 // Copy the reader data to the object specified by remote.
 //
 // It returns the object created and an error, if any.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	// Get file path and size
-	remote := src.Remote()
-	size := src.Size()
-
 	// Check if file exists and remove it if necessary
-	obj, err := f.NewObject(ctx, remote)
+	existingObj, err := f.NewObject(ctx, src.Remote())
 	if err == nil {
 		// File exists, delete it
-		err = obj.Remove(ctx)
+		err = existingObj.Remove(ctx)
 		if err != nil {
 			return nil, err
 		}
 	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
 		return nil, err
 	}
-	// Find upload target directory, create if necessary
-	_, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
+
+	// Use PutUnchecked to upload the file
+	return f.PutUnchecked(ctx, in, src, options...)
+}
+
+// PutUnchecked uploads the object without checking if it exists
+//
+// This will create a duplicate if the object already exists.
+//
+// Copy the reader data to the object specified by remote.
+//
+// It returns the object created and an error, if any.
+func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	// Get file path and size
+	remote := src.Remote()
+	size := src.Size()
+	modTime := src.ModTime(ctx)
+
+	// Create object and ensure directory exists
+	_, _, directoryID, err := f.createObject(ctx, remote, modTime, size)
 	if err != nil {
 		return nil, err
 	}
@@ -684,12 +724,8 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fmt.Errorf("can't copy across different remotes: %w", fs.ErrorCantCopy)
 	}
 
-	// Find destination parent directory
-	dstDir := path.Dir(remote)
-	if dstDir == "." || dstDir == "/" {
-		dstDir = ""
-	}
-	dstDirID, err := f.dirCache.FindDir(ctx, dstDir, true)
+	// Create the destination object and ensure directory exists
+	_, _, dstDirID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
 	if err != nil {
 		return nil, err
 	}
@@ -701,6 +737,10 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Flush directory cache
+	dstDir := path.Dir(remote)
+	if dstDir == "." || dstDir == "/" {
+		dstDir = ""
+	}
 	f.dirCache.FlushDir(dstDir)
 
 	// Return new object
@@ -722,12 +762,8 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fmt.Errorf("can't move across different remotes: %w", fs.ErrorCantMove)
 	}
 
-	// Find destination parent directory
-	dstDir := path.Dir(remote)
-	if dstDir == "." || dstDir == "/" {
-		dstDir = ""
-	}
-	dstDirID, err := f.dirCache.FindDir(ctx, dstDir, true)
+	// Create the destination object and ensure directory exists
+	_, _, dstDirID, err := f.createObject(ctx, remote, srcObj.modTime, srcObj.size)
 	if err != nil {
 		return nil, err
 	}
@@ -739,6 +775,10 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Flush directory cache
+	dstDir := path.Dir(remote)
+	if dstDir == "." || dstDir == "/" {
+		dstDir = ""
+	}
 	f.dirCache.FlushDir(dstDir)
 
 	// Return new object
