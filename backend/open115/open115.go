@@ -67,7 +67,9 @@ func Register(fName string) {
 					ts := &TokenSource{
 						name:  name,
 						ctx:   ctx,
+						c:     rc,
 						token: &apiToken,
+						m:     m,
 					}
 					// check if token is already present and valid
 					if _, err = ts.Token(); err == nil {
