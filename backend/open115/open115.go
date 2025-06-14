@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/rclone/rclone/fs/fserrors"
 	"io"
 	"net/http"
 	"net/url"
@@ -18,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rclone/rclone/fs/fserrors"
 
 	"github.com/rclone/rclone/lib/rest"
 
@@ -58,23 +59,25 @@ func Register(fName string) {
 			rc := rest.NewClient(fc)
 
 			token, _ := m.Get("token")
-			var apiToken api.Token
-			err := json.Unmarshal([]byte(token), &apiToken)
-			if err != nil {
-				return nil, err
-			}
-			ts := &TokenSource{
-				name:  name,
-				ctx:   ctx,
-				token: &apiToken,
-			}
-			// check if token is already present and valid
-			if _, err = ts.Token(); err == nil {
-				// token is valid, no need to re-authenticate
-				return &fs.ConfigOut{State: ""}, nil
+			// Only try to parse token if it exists and is not empty
+			if token != "" {
+				var apiToken api.Token
+				err := json.Unmarshal([]byte(token), &apiToken)
+				if err == nil {
+					ts := &TokenSource{
+						name:  name,
+						ctx:   ctx,
+						token: &apiToken,
+					}
+					// check if token is already present and valid
+					if _, err = ts.Token(); err == nil {
+						// token is valid, no need to re-authenticate
+						return &fs.ConfigOut{State: ""}, nil
+					}
+				}
 			}
 			opt := new(Options)
-			err = configstruct.Set(m, opt)
+			err := configstruct.Set(m, opt)
 			if err != nil {
 				return nil, err
 			}
