@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/rclone/rclone/lib/rest"
+	"github.com/skip2/go-qrcode"
 	"math/big"
 	"net/url"
 	"strings"
@@ -153,7 +154,7 @@ func (ts *TokenSource) refreshToken() error {
 	if err != nil {
 		return fmt.Errorf("failed to refresh token: %v", err)
 	}
-	// token expired
+	// Check if token expired
 	if resp.Code == errorCodeRefreshTokenExpired || resp.Code == errorCodeRefreshTokenInvalid {
 		// Clear token
 		ts.token = nil
@@ -161,6 +162,16 @@ func (ts *TokenSource) refreshToken() error {
 		err = ts.saveToken()
 		return fmt.Errorf("refresh token expired, please run 'rclone config reconnect %s:'", ts.name)
 	}
+
+	// Check if response is valid
+	if resp.Code != 0 || resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
+		// Clear token
+		ts.token = nil
+		ts.expiry = time.Time{}
+		err = ts.saveToken()
+		return fmt.Errorf("faild get token from server: %s", resp.Message)
+	}
+
 	// Update token
 	ts.token.AccessToken = resp.Data.AccessToken
 	ts.token.RefreshToken = resp.Data.RefreshToken
@@ -188,6 +199,8 @@ func (ts *TokenSource) saveToken() error {
 	ts.m.Set(config.ConfigToken, string(tokenJSON))
 	return nil
 }
+
+// Auth initiates the authorization process using QR code
 func (ts *TokenSource) Auth(appId string) error {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
@@ -196,8 +209,20 @@ func (ts *TokenSource) Auth(appId string) error {
 	if err != nil {
 		return err
 	}
-	// Display QR code URL for user to scan
+
+	// Display QR code for user to scan
 	fs.Logf(nil, "Please use the 115 mobile app to scan the QR code: %s", authData.QRCode)
+	fs.Logf(nil, "The QR Code image file is also saved in the current directory as 'open115_qrcode.png'")
+	qrCode, err := qrcode.New(authData.QRCode, qrcode.Medium)
+	if err != nil {
+		return fmt.Errorf("failed to generate QR code: %w", err)
+	}
+	err = qrCode.WriteFile(256, "open115_qrcode.png")
+	if err != nil {
+		return fmt.Errorf("failed to generate QR code: %w", err)
+	}
+	fs.Print(nil, "\n"+qrCode.ToSmallString(false))
+
 	// Wait for user to scan and confirm authorization
 	token, err := ts.waitForQRCodeScan(ts.ctx, authData)
 	if err != nil {
@@ -308,6 +333,10 @@ func (ts *TokenSource) codeToToken(ctx context.Context, authData *api.AuthDevice
 	_, err := ts.c.CallJSON(ctx, &opts, nil, &resp)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get token: %w", err)
+	}
+	// Check if response is valid
+	if resp.Code != 0 || resp.Data.AccessToken == "" || resp.Data.RefreshToken == "" {
+		return nil, fmt.Errorf("failed to get token from server: %s", resp.Message)
 	}
 	// Create Token object
 	expiresAt := time.Now().Add(time.Duration(resp.Data.ExpiresIn) * time.Second)

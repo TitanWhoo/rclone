@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rclone/rclone/lib/oauthutil"
 	"io"
 	"net/http"
 	"net/url"
@@ -57,27 +58,6 @@ func Register(fName string) {
 		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 			fc := fshttp.NewClient(ctx)
 			rc := rest.NewClient(fc)
-
-			token, _ := m.Get("token")
-			// Only try to parse token if it exists and is not empty
-			if token != "" {
-				var apiToken api.Token
-				err := json.Unmarshal([]byte(token), &apiToken)
-				if err == nil {
-					ts := &TokenSource{
-						name:  name,
-						ctx:   ctx,
-						c:     rc,
-						token: &apiToken,
-						m:     m,
-					}
-					// check if token is already present and valid
-					if _, err = ts.Token(); err == nil {
-						// token is valid, no need to re-authenticate
-						return &fs.ConfigOut{State: ""}, nil
-					}
-				}
-			}
 			opt := new(Options)
 			err := configstruct.Set(m, opt)
 			if err != nil {
@@ -98,7 +78,7 @@ func Register(fName string) {
 			},
 			{
 				Name:     "refresh_token",
-				Help:     "Refresh Token (instead of use appid to authorize)",
+				Help:     "Refresh Token (use token instead of appid to authorize)",
 				Required: false,
 			},
 		},
@@ -416,7 +396,6 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		return nil, fs.ErrorNotImplemented
 	}
 
-	// 执行文件上传
 	// Execute file upload
 	return f.upload(ctx, in, remote, directoryID, size)
 }
@@ -810,18 +789,32 @@ func (f *Fs) OAuth(ctx context.Context, name string, m configmap.Mapper, oauthCo
 // Config handles the configuration process.
 func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 	switch config.State {
-	case "", "choose_auth_type":
+	case "":
+		// Check token exists
+		if _, err := oauthutil.GetToken(name, m); err != nil {
+			return fs.ConfigGoto("choose_auth_type")
+		}
+		return fs.ConfigConfirm("choose_reauthorize", false, "consent_to_authorize", "Re-authorize for new token?")
+	case "choose_reauthorize":
+		if config.Result == "false" {
+			// User doesn't want to re-authorize, so return empty state
+			return nil, nil
+		} else {
+			// User wants to re-authorize, so proceed to choose auth type
+			return fs.ConfigGoto("choose_auth_type")
+		}
+	case "choose_auth_type":
 		return fs.ConfigChooseExclusiveFixed("choose_auth_type_done", "auth_type", "Select authorization type", []fs.OptionExample{
 			{Value: "token", Help: "Authenticate using an existing refresh token"},
 			{Value: "auth", Help: "Authenticate using your 115 Cloud Open Platform (requires App ID)"},
 		})
 	case "choose_auth_type_done":
 		if config.Result == "auth" {
-			return fs.ConfigGoto(config.Result)
+			return fs.ConfigGoto("authorize")
 		} else if config.Result == "token" {
-			return fs.ConfigInput("token", "Enter your refresh token", "Please enter your refresh token")
+			return fs.ConfigInput("authorize_token", "Enter your refresh token", "Please enter your refresh token")
 		}
-	case "token":
+	case "authorize_token":
 		// Use TokenSource to save token
 		fc := fshttp.NewClient(ctx)
 		ts := &TokenSource{
@@ -838,7 +831,7 @@ func (f *Fs) Config(ctx context.Context, name string, m configmap.Mapper, config
 			return nil, fmt.Errorf("failed to validate/refresh token: %v", err)
 		}
 		return &fs.ConfigOut{State: ""}, nil
-	case "auth":
+	case "authorize":
 		opt := new(Options)
 		err := configstruct.Set(m, opt)
 		if err != nil {
