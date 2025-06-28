@@ -665,7 +665,7 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		})
 	} else {
 		// Move to a different parent directory
-		_, err = f.moveFiles(ctx, []string{srcDirectoryID}, dstDirectoryID)
+		_, err = f.moveFiles(ctx, []string{srcID}, dstDirectoryID)
 	}
 
 	if err != nil {
