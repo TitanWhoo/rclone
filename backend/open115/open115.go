@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/rclone/rclone/lib/oauthutil"
 	"io"
 	"net/http"
 	"net/url"
@@ -18,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rclone/rclone/lib/oauthutil"
 
 	"github.com/rclone/rclone/fs/fserrors"
 
@@ -651,40 +652,27 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fmt.Errorf("can't move directories across different remotes: %w", fs.ErrorCantMove)
 	}
 
-	// Find source directory ID
-	srcDirID, err := srcFs.dirCache.FindDir(ctx, srcRemote, false)
+	srcID, srcDirectoryID, _, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
 	if err != nil {
 		return err
 	}
 
-	// Find destination parent directory
-	dstDir := path.Dir(dstRemote)
-	if dstDir == "." || dstDir == "/" {
-		dstDir = ""
-	}
-	dstDirID, err := f.dirCache.FindDir(ctx, dstDir, true)
-	if err != nil {
-		return err
-	}
-
-	// Rename or move directory
-	if srcFs == f && path.Dir(srcRemote) == path.Dir(dstRemote) {
-		// Rename directory
-		newName := path.Base(dstRemote)
-		_, err = f.updateFile(ctx, srcDirID, map[string]string{
-			"file_name": newName,
+	// If the destination does not exist, decide whether to rename or move
+	if srcDirectoryID == dstDirectoryID {
+		// Rename directory within the same parent
+		_, err = f.updateFile(ctx, srcID, map[string]string{
+			"file_name": dstLeaf,
 		})
 	} else {
-		// Move directory
-		_, err = f.moveFiles(ctx, []string{srcDirID}, dstDirID)
+		// Move to a different parent directory
+		_, err = f.moveFiles(ctx, []string{srcDirectoryID}, dstDirectoryID)
 	}
+
 	if err != nil {
 		return err
 	}
-
-	// After successful move, update cache
+	// Flush directory cache
 	srcFs.dirCache.FlushDir(srcRemote)
-	f.dirCache.FlushDir(dstDir)
 	return nil
 }
 
@@ -716,10 +704,7 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Flush directory cache
-	dstDir := path.Dir(remote)
-	if dstDir == "." || dstDir == "/" {
-		dstDir = ""
-	}
+	dstDir, _ := f.getNormalizedPath(remote)
 	f.dirCache.FlushDir(dstDir)
 
 	// Return new object
@@ -754,10 +739,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}
 
 	// Flush directory cache
-	dstDir := path.Dir(remote)
-	if dstDir == "." || dstDir == "/" {
-		dstDir = ""
-	}
+	dstDir, _ := f.getNormalizedPath(remote)
 	f.dirCache.FlushDir(dstDir)
 
 	// Return new object
@@ -1551,6 +1533,17 @@ func (f *Fs) getUserInfo(ctx context.Context) (*api.UserInfoResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// getNormalizedPath splits a path into a parent and a leaf.
+// The parent is normalized to an empty string if it is "." or "/".
+func (f *Fs) getNormalizedPath(p string) (parent, leaf string) {
+	parent = path.Dir(p)
+	if parent == "." || parent == "/" {
+		parent = ""
+	}
+	leaf = path.Base(p)
+	return
 }
 
 // Interfaces implementation check
