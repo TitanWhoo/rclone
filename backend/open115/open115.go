@@ -2,6 +2,7 @@
 package open115
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -24,8 +25,7 @@ import (
 
 	"github.com/rclone/rclone/lib/rest"
 
-	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
-	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
+	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/rclone/rclone/backend/open115/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -43,7 +43,31 @@ const (
 	decayConstant = 2                      // decayConstant is the backoff factor.
 	rootID        = "0"                    // rootID is the ID of the root directory.
 	objectDir     = "0"
+	MB            = 1024 * 1024
+	GB            = 1024 * MB
+	TB            = 1024 * GB
 )
+
+// calPartSize calculates the part size for multipart upload based on file size
+func calPartSize(fileSize int64) int64 {
+	var partSize int64 = 20 * MB
+	if fileSize > partSize {
+		if fileSize > 1*TB { // file Size over 1TB
+			partSize = 5 * GB // file part size 5GB
+		} else if fileSize > 768*GB { // over 768GB
+			partSize = 109951163 // ≈ 104.8576MB, split 1TB into 10,000 part
+		} else if fileSize > 512*GB { // over 512GB
+			partSize = 82463373 // ≈ 78.6432MB
+		} else if fileSize > 384*GB { // over 384GB
+			partSize = 54975582 // ≈ 52.4288MB
+		} else if fileSize > 256*GB { // over 256GB
+			partSize = 41231687 // ≈ 39.3216MB
+		} else if fileSize > 128*GB { // over 128GB
+			partSize = 27487791 // ≈ 26.2144MB
+		}
+	}
+	return partSize
+}
 
 // init registers the backend.
 func init() {
@@ -862,37 +886,18 @@ func parseSignCheckRange(signCheck string) (start, end int64, err error) {
 	return start, end, nil
 }
 
-// getOssRegion extracts region from OSS endpoint
-func getOssRegion(endpoint string) string {
-	if strings.HasPrefix(endpoint, "http://") {
-		endpoint = strings.TrimPrefix(endpoint, "http://")
-	} else if strings.HasPrefix(endpoint, "https://") {
-		endpoint = strings.TrimPrefix(endpoint, "https://")
-	}
-
-	parts := strings.Split(endpoint, ".")
-	if len(parts) >= 1 {
-		regionPart := parts[0]
-		if strings.HasPrefix(regionPart, "oss-") {
-			return strings.TrimPrefix(regionPart, "oss-")
-		}
-	}
-
-	return "cn-hangzhou" // default region
-}
-
 // uploadToOSS uploads a file to Alibaba Cloud OSS
 func uploadToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData, token api.UploadTokenData) error {
-	// Create OSS c
-	provider := credentials.NewStaticCredentialsProvider(token.AccessKeyId, token.AccessKeySecret, token.SecurityToken)
-	cfg := oss.LoadDefaultConfig().
-		WithRegion(getOssRegion(token.Endpoint)).
-		WithEndpoint(token.Endpoint).
-		WithCredentialsProvider(provider).
-		WithConnectTimeout(10 * time.Second).
-		WithReadWriteTimeout(30 * time.Second).
-		WithRetryMaxAttempts(5)
-	ossClient := oss.NewClient(cfg)
+	// Create OSS client
+	ossClient, err := oss.New(token.Endpoint, token.AccessKeyId, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
+	if err != nil {
+		return fmt.Errorf("failed to create OSS client: %w", err)
+	}
+
+	bucket, err := ossClient.Bucket(initData.Bucket)
+	if err != nil {
+		return fmt.Errorf("failed to get bucket: %w", err)
+	}
 
 	// Parse callback data
 	callback, err := initData.GetCallback()
@@ -905,22 +910,80 @@ func uploadToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData,
 	callbackVarStr := base64.StdEncoding.EncodeToString([]byte(callback.CallbackVar))
 
 	// Perform upload
-	result, err := ossClient.PutObject(ctx, &oss.PutObjectRequest{
-		Bucket:      oss.Ptr(initData.Bucket),
-		Key:         oss.Ptr(initData.Object),
-		Callback:    oss.Ptr(callbackStr),
-		CallbackVar: oss.Ptr(callbackVarStr),
-		Body:        in,
-	})
+	err = bucket.PutObject(initData.Object, in,
+		oss.Callback(callbackStr),
+		oss.CallbackVar(callbackVarStr),
+	)
 	if err != nil {
-		return fmt.Errorf("failed to upload to OSS %w", err)
+		return fmt.Errorf("failed to upload to OSS: %w", err)
 	}
-	res, _ := json.Marshal(result)
-	fs.Debugf(nil, "uploaded %s to OSS, response: %s", initData.Object, res)
-	if code, ok := result.CallbackResult["code"]; !ok || fmt.Sprintf("%v", code) != "0" {
-		return fmt.Errorf("callback error %s", res)
+
+	fs.Debugf(nil, "uploaded %s to OSS successfully", initData.Object)
+	return nil
+}
+
+// uploadMultipartToOSS uploads a file to Alibaba Cloud OSS using multipart upload
+// Known limitations:
+// Due to some special restrictions on callback by Open115,
+// it seems that parallel multipart uploads are not allowed.
+func uploadMultipartToOSS(ctx context.Context, in io.Reader, initData api.InitUploadData, token api.UploadTokenData, fileSize, chunkSize int64) error {
+	ossClient, err := oss.New(token.Endpoint, token.AccessKeyId, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
+	if err != nil {
+		return fmt.Errorf("failed to create OSS client: %w", err)
 	}
-	return err
+	bucket, err := ossClient.Bucket(initData.Bucket)
+	if err != nil {
+		return fmt.Errorf("failed to get bucket: %w", err)
+	}
+	callback, err := initData.GetCallback()
+	if err != nil {
+		return err
+	}
+	callbackStr := base64.StdEncoding.EncodeToString([]byte(callback.Callback))
+	callbackVarStr := base64.StdEncoding.EncodeToString([]byte(callback.CallbackVar))
+
+	imur, err := bucket.InitiateMultipartUpload(initData.Object, oss.Sequential())
+	if err != nil {
+		return fmt.Errorf("failed to initiate multipart upload: %w", err)
+	}
+
+	partNum := (fileSize + chunkSize - 1) / chunkSize
+	parts := make([]oss.UploadPart, partNum)
+	buf := make([]byte, chunkSize)
+
+	for i := int64(1); i <= partNum; i++ {
+		if ctx.Err() != nil {
+			_ = bucket.AbortMultipartUpload(imur)
+			return ctx.Err()
+		}
+		curSize := chunkSize
+		if i == partNum {
+			curSize = fileSize - (i-1)*chunkSize
+		}
+		n, err := io.ReadFull(in, buf[:curSize])
+		if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			_ = bucket.AbortMultipartUpload(imur)
+			return fmt.Errorf("failed to read part %d data: %w", i, err)
+		}
+		part, err := bucket.UploadPart(imur, bytes.NewReader(buf[:n]), int64(n), int(i))
+		if err != nil {
+			_ = bucket.AbortMultipartUpload(imur)
+			return fmt.Errorf("failed to upload part %d: %w", i, err)
+		}
+		parts[i-1] = part
+	}
+
+	_, err = bucket.CompleteMultipartUpload(
+		imur,
+		parts,
+		oss.Callback(callbackStr),
+		oss.CallbackVar(callbackVarStr),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to complete multipart upload: %w", err)
+	}
+	fs.Debugf(nil, "multipart uploaded %s to OSS successfully", initData.Object)
+	return nil
 }
 
 // ReadSeekerFile implements a file-like interface wrapping io.ReadSeeker
@@ -1181,8 +1244,17 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, remote string,
 		return nil, fmt.Errorf("failed to seek to start: %w", err)
 	}
 
-	// Upload file to OSS
-	err = uploadToOSS(ctx, reader, *initData, tokenResp.Data)
+	// Calculate chunk size
+	chunkSize := calPartSize(size)
+
+	// Choose upload method based on file size
+	if chunkSize >= size {
+		// Use single upload for small files
+		err = uploadToOSS(ctx, reader, *initData, tokenResp.Data)
+	} else {
+		// Use multipart upload for large files
+		err = uploadMultipartToOSS(ctx, reader, *initData, tokenResp.Data, size, chunkSize)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to upload file to OSS: %w", err)
 	}

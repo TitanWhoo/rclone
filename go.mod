@@ -14,7 +14,7 @@ require (
 	github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e
 	github.com/aalpar/deheap v0.0.0-20210914013432-0cc84d79dec3
 	github.com/abbot/go-http-auth v0.4.0
-	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.2.1
+	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
 	github.com/anacrolix/dms v1.7.1
 	github.com/anacrolix/log v0.16.0
 	github.com/atotto/clipboard v0.1.4
